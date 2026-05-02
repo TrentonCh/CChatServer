@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>C Chat — Web Client</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1d23;
+    color: #e6e8eb;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 12px 20px;
+    border-bottom: 1px solid #2a2e36;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #2a2e36;
+  }
+  #status.connected { background: #1f4d2b; color: #8de2a3; }
+  #status.error { background: #5a1f23; color: #ffb4b8; }
+
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    max-width: 800px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 20px;
+    overflow: hidden;
+  }
+
+  /* Screens swap visibility */
+  .screen { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  .screen.active { display: flex; }
+
+  /* Room picker */
+  #rooms-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  #rooms-list li {
+    background: #242830;
+    border: 1px solid #2a2e36;
+    border-radius: 8px;
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  #rooms-list li:hover { background: #2a2e36; border-color: #3a3f4a; }
+  #rooms-list li .topic { font-weight: 600; }
+  #rooms-list li .meta { font-size: 12px; color: #8b909a; margin-top: 4px; }
+  #empty-state { color: #8b909a; padding: 20px; text-align: center; }
+
+  button {
+    background: #3a6ddc;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #4a7de8; }
+  button:disabled { background: #2a2e36; color: #6b7280; cursor: not-allowed; }
+
+  /* Chat screen */
+  #chat-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #2a2e36;
+    margin-bottom: 12px;
+  }
+  #chat-title { font-weight: 600; }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .msg {
+    padding: 6px 10px;
+    border-radius: 6px;
+    line-height: 1.4;
+    word-wrap: break-word;
+  }
+  .msg.system {
+    background: #2a2e36;
+    color: #8b909a;
+    font-style: italic;
+    font-size: 13px;
+    align-self: center;
+  }
+  .msg.prompt {
+    background: #1f3556;
+    color: #b8d0f0;
+    font-size: 13px;
+  }
+  .msg.incoming { background: #242830; }
+  .msg.outgoing { background: #2d4a7a; align-self: flex-end; max-width: 80%; }
+  .msg .author { font-weight: 600; color: #8de2a3; margin-right: 6px; }
+
+  #input-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #2a2e36;
+  }
+  #input-row input {
+    flex: 1;
+    background: #242830;
+    border: 1px solid #2a2e36;
+    color: #e6e8eb;
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+  }
+  #input-row input:focus { outline: none; border-color: #3a6ddc; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>C Chat — Web Client</h1>
+  <span id="status">disconnected</span>
+</header>
+
+<main>
+  <!-- Screen 1: room picker -->
+  <section id="screen-rooms" class="screen active">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h2 style="margin:0;font-size:18px;">Available chat rooms</h2>
+      <button id="refresh-btn">Refresh</button>
+    </div>
+    <ul id="rooms-list"></ul>
+    <div id="empty-state" style="display:none;">No chat rooms are currently registered.</div>
+  </section>
+
+  <!-- Screen 2: chat -->
+  <section id="screen-chat" class="screen">
+    <div id="chat-header">
+      <span id="chat-title"></span>
+      <button id="leave-btn">Leave</button>
+    </div>
+    <div id="messages"></div>
+    <div id="input-row">
+      <input id="input" type="text" placeholder="Type a message and press Enter…" autocomplete="off" />
+      <button id="send-btn">Send</button>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  // ---------- DOM refs ----------
+  const $status     = document.getElementById('status');
+  const $screenRooms = document.getElementById('screen-rooms');
+  const $screenChat  = document.getElementById('screen-chat');
+  const $roomsList  = document.getElementById('rooms-list');
+  const $emptyState = document.getElementById('empty-state');
+  const $refreshBtn = document.getElementById('refresh-btn');
+  const $chatTitle  = document.getElementById('chat-title');
+  const $leaveBtn   = document.getElementById('leave-btn');
+  const $messages   = document.getElementById('messages');
+  const $input      = document.getElementById('input');
+  const $sendBtn    = document.getElementById('send-btn');
+
+  // ---------- State ----------
+  let ws = null;
+  let mode = 'directory'; // 'directory' (issuing JSON) | 'chat' (raw bytes)
+  let currentTopic = null;
+  // The C server first prompts "Enter in your name: ". We track whether
+  // we've seen that and whether the user has supplied a name yet.
+  let usernameSent = false;
+  let usernameAccepted = false;
+
+  // ---------- Helpers ----------
+  function setStatus(text, cls = '') {
+    $status.textContent = text;
+    $status.className = cls;
+  }
+  function showScreen(name) {
+    $screenRooms.classList.toggle('active', name === 'rooms');
+    $screenChat.classList.toggle('active', name === 'chat');
+  }
+  function addMsg(text, kind = 'incoming') {
+    const el = document.createElement('div');
+    el.className = `msg ${kind}`;
+    // Server sends "username: text" for broadcasts. Split visually.
+    if (kind === 'incoming' && /^[^:]{1,40}: /.test(text)) {
+      const idx = text.indexOf(': ');
+      const author = text.slice(0, idx);
+      const body = text.slice(idx + 2);
+      const a = document.createElement('span');
+      a.className = 'author';
+      a.textContent = author + ':';
+      el.appendChild(a);
+      el.appendChild(document.createTextNode(body));
+    } else {
+      el.textContent = text;
+    }
+    $messages.appendChild(el);
+    $messages.scrollTop = $messages.scrollHeight;
+  }
+
+  // ---------- WebSocket lifecycle ----------
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      setStatus('connected', 'connected');
+      // Immediately ask for the room list.
+      ws.send(JSON.stringify({ type: 'list' }));
+    };
+    ws.onclose = () => {
+      setStatus('disconnected');
+      if (mode === 'chat') {
+        addMsg('— Connection closed —', 'system');
+      }
+    };
+    ws.onerror = () => {
+      setStatus('error', 'error');
+    };
+
+    ws.onmessage = (ev) => {
+      // In 'directory' mode we receive JSON.
+      // In 'chat' mode the proxy sends raw text frames from the C server.
+      if (mode === 'directory') {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        handleDirectoryMessage(msg);
+      } else {
+        const text = (typeof ev.data === 'string') ? ev.data : new TextDecoder().decode(ev.data);
+        handleChatBytes(text);
+      }
+    };
+  }
+
+  function handleDirectoryMessage(msg) {
+    if (msg.type === 'rooms') {
+      renderRooms(msg.rooms);
+    } else if (msg.type === 'joined') {
+      mode = 'chat';
+      currentTopic = msg.topic;
+      $chatTitle.textContent = `# ${msg.topic}`;
+      $messages.innerHTML = '';
+      usernameSent = false;
+      usernameAccepted = false;
+      showScreen('chat');
+      $input.focus();
+    } else if (msg.type === 'error') {
+      alert(`Error: ${msg.message}`);
+      setStatus('error', 'error');
+    } else if (msg.type === 'closed') {
+      addMsg('Server closed the connection', 'system');
+    }
+  }
+
+  function handleChatBytes(text) {
+    // Strip trailing newlines for display, but preserve internal structure.
+    const trimmed = text.replace(/\r/g, '');
+
+    // The C server sends a name prompt first. Treat it as a system prompt.
+    if (!usernameAccepted && /Enter in your name:/.test(trimmed)) {
+      addMsg(trimmed.trim(), 'prompt');
+      addMsg('Type a username and hit Enter to join.', 'system');
+      return;
+    }
+    if (!usernameAccepted && /nickname has been taken/i.test(trimmed)) {
+      usernameSent = false;
+      addMsg(trimmed.trim(), 'prompt');
+      return;
+    }
+    // After username send, the next message is either "first user" or
+    // a join-broadcast addressed to others. Either way, mark accepted.
+    if (usernameSent && !usernameAccepted) {
+      usernameAccepted = true;
+    }
+
+    // Split on newlines so each broadcast becomes its own bubble.
+    trimmed.split('\n').forEach(line => {
+      const t = line.trim();
+      if (!t) return;
+      if (/^The user, .* has (joined|left) the chat/.test(t) ||
+          /first user to join/.test(t)) {
+        addMsg(t, 'system');
+      } else {
+        addMsg(t, 'incoming');
+      }
+    });
+  }
+
+  // ---------- Room list rendering ----------
+  function renderRooms(rooms) {
+    $roomsList.innerHTML = '';
+    if (!rooms || rooms.length === 0) {
+      $emptyState.style.display = 'block';
+      return;
+    }
+    $emptyState.style.display = 'none';
+    rooms.forEach(r => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <div class="topic"></div>
+        <div class="meta"></div>`;
+      li.querySelector('.topic').textContent = r.topic;
+      li.querySelector('.meta').textContent = `${r.ip}:${r.port}`;
+      li.addEventListener('click', () => joinRoom(r));
+      $roomsList.appendChild(li);
+    });
+  }
+
+  function joinRoom(room) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'join', topic: room.topic, ip: room.ip, port: room.port }));
+  }
+
+  // ---------- Sending ----------
+  function send() {
+    const text = $input.value;
+    if (!text) return;
+    if (mode !== 'chat' || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    if (!usernameAccepted && !usernameSent) {
+      // First message after join is the username.
+      ws.send(text);
+      usernameSent = true;
+      addMsg(`(joining as "${text}")`, 'system');
+    } else {
+      ws.send(text);
+      addMsg(text, 'outgoing');
+    }
+    $input.value = '';
+  }
+
+  // ---------- Wire up UI ----------
+  $refreshBtn.addEventListener('click', () => {
+    if (ws && ws.readyState === WebSocket.OPEN && mode === 'directory') {
+      ws.send(JSON.stringify({ type: 'list' }));
+    }
+  });
+  $leaveBtn.addEventListener('click', () => {
+    if (ws) ws.close();
+    mode = 'directory';
+    currentTopic = null;
+    showScreen('rooms');
+    setTimeout(connect, 100); // reconnect to refresh list
+  });
+  $sendBtn.addEventListener('click', send);
+  $input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>
