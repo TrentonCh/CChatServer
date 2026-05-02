@@ -1,167 +1,201 @@
-1. Modify inet.h to reflect the host you are currently logged into.
-   Also, modify the port numbers to be used to reduce the likelihood
-   of conflicting with another server.
- 
-2. Compile the source code using the command: make
- 
-3. Start the chat and directory servers in the background: ./directoryServer5 &; ./chatServer5 &
- 
-4. Start the client on the same or another host in the foreground: ./chatClient5
- 
-5. Remember to kill the server before logging off.
+# C Chat with Web Frontend
 
-6. Note: Sometimes when running the directory on cougar and the client on viper when opening and closing clients fast the directory won't populate.
-The error (Error: reading from directory) does not happen when the directory is on viper and the client is on cougar and is intermittent. We believe this to be a network issue outside of the code. If you continue to try to restart the client it will fix it.
+A multi-room chat system built around a directory-of-services architecture in C, with a browser-based frontend that communicates with the original C servers — unmodified — through a small WebSocket proxy. The whole thing runs over TLS 1.3 with mutual certificate verification.
 
-Acceptable Chat Server Names:
-    KSU Football
-    KSU Basketball
-    Puppies
-    Fortnite
-    KSU Compsci
+## What it is
 
-Group Members (Group 8):
-    Patrick Kehoe
-    Kylie Phommasack
-    Trenton Chrisco
-    Connor Bauer
+The system has three independent C programs and a web layer:
 
-Overview
-    This project extends the chat system that was developed in earlier Programming Assignments by adding
-    TLS 1.3 secure communication to all components (Directory Server, Chat Server, and the Chat Client).
-    Each Connection is now encrypted and authenticating using OpenSSL. All communication, including registration, listing
-    chat rooms, sending messages, and receiving broadcasts, is performed securely.
+- **`directoryServer5`** — A registry that knows about every running chat room. Chat servers register with it on startup and deregister on shutdown. Clients query it for the list of available rooms.
+- **`chatServer5`** — One process per chat room. Hosts a topic (e.g. "KSU Football"), accepts client connections, broadcasts messages between them, and tells the directory server it exists.
+- **`chatClient5`** — The original command-line client. Lists rooms, prompts the user to pick one, then handles a TLS chat session over `select()` and stdin.
+- **Web frontend (Node proxy + HTML/JS)** — A drop-in replacement for `chatClient5` that runs in the browser. The C servers don't know or care that the connection is coming from a browser instead of the CLI client.
 
-    We purposefully did not limit the amount of clients. We could not find information about this within the instructions.
+All inter-process communication is over TLS 1.3 with certificate-based identity. A chat server proves it's authoritative for its topic by presenting a cert with that topic as the Common Name. The directory server presents itself as `"Directory Server"`. Clients verify these CNs explicitly.
 
-    We also changed MAX from 100 to 1000
+## How it works
 
-    In the makefile we uncommented the line:
-        LIBS	= -lcrypto -lssl
-    in order to utilize this library throughout implementation.
+### The C side
 
-File Structure & Purpose:
-    directoryServer5:
-        The directory server maintains a dynamic list of available chat rooms. 
-        The responsibilites of the file are:
-            - Accept TLS-secured connections from chat servers and clients
-            - Verify chat server certificates using our custom CA
-            - Register chat servers using: "R <topic> <port>"
-            - Deregister chat servers using: "D <topic>"
-            - Provide room listing using: "L"
-            - Protects all communication using TLS 1.3
-            - Prevents duplicate room names
-            - Ensures that certificate CN matches the room topic
-        The directory server is always started first and acts as the root of trust within the system.
+```
+                 ┌────────────────────────┐
+                 │   directoryServer5     │
+                 │   (port 57535, TLS)    │
+                 │   keeps a list of      │
+                 │   registered rooms     │
+                 └───────────▲────────────┘
+                             │ R/L/D commands
+            ┌────────────────┼────────────────┐
+            │                │                │
+   ┌────────┴───────┐ ┌──────┴────────┐ ┌─────┴──────────┐
+   │ chatServer5    │ │ chatServer5   │ │ chatServer5    │
+   │ "KSU Football" │ │ "Puppies"     │ │ "Fortnite"     │
+   │ (port 50000)   │ │ (port 50001)  │ │ (port 50002)   │
+   └────────▲───────┘ └───────▲───────┘ └────────▲───────┘
+            │                 │                  │
+            │  TLS chat sessions, broadcasted    │
+            │  to other clients in the same room │
+            ▼                 ▼                  ▼
+        clients (CLI or web)
+```
 
-    chatServer5:
-        The chat server hosts one specific chat room topic.
-        The responsibilites of the file are:
-            - Load the correct certificate and key based on the topic
-            - Establish TLS 1.3 connection to the Directory Server
-            - Register its topic and port securely
-            - Accept TLS connections from clients
-            - Authenticate and complete TLS handshake for each client
-            - Manage multiple active clients using select (no threads)
-            - Relay user messages to all other members
-            - Broadcast join/leave notifications
-            - Deregister from the Directory Server when terminated
-            When terminated, the chatClients will provide a message and close as well.
-        Each chat server uses a certificate whose CN matches the topic name (like "KSU FOOTBALL" etc.)
-        
-    chatClient5:
-        The chat client allows users to communciate with one another after inputting a valid chat room and user name.
-        The file allows users to:
-            - Connect to the Directory Server using TLS
-            - Verify that the Directory Server’s certificate CN is exactly "Directory Server"
-            - Retrieve list of available chat rooms
-            - Enter a topic name to join (which is validated)
-            - Verify that the chat server’s certificate CN matches the chosen topic
-            - Send and receive broadcasted chat messages securely
-            - Handle disconnects gracefully
+**The directory protocol** is a single byte followed by optional data:
+- `L` — list rooms. Returns one line per room: `Topic IP Port\n`.
+- `R <topic> <port>` — register. Requires a client cert whose CN matches the topic.
+- `D <topic>` — deregister. Same cert requirement.
 
-How to Build/Run:
-    1. make
-    2. ./directoryServer5 &                                                 (start this in the background)
-    3. ./chatServer5 "<the acceptable chat room name>" <port number> &      (this works with all chat rooms listed above, and start in background)
-    4. ./chatClient5                                                        (start a client, this will provide the given chat rooms a user can join)
+**The chat server protocol** is a stream of bytes over TLS:
+1. On connect, server sends `Enter in your name: `.
+2. Client sends a username.
+3. If the name is taken, server sends `Your nickname has been taken.\nPlease enter in a new nickname: ` and tries again.
+4. Once accepted, every message the client sends gets broadcast to all other clients as `username: message`.
+5. Join and leave events are broadcast as `The user, X, has joined/left the chat`.
 
-Requirements:
-    Topic name must match one of the acceptable names
-    Port must be between 49151–65536
+**Certificates** are checked at every hop:
+- Chat servers verify the directory server's CN before registering.
+- Clients verify the directory server's CN before requesting the room list.
+- Clients verify each chat server's CN matches the topic before joining.
+- The directory server verifies a client cert is present (with matching CN) before honoring `R` or `D`.
 
-Example Output:
-1. Start the directory server
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ ./directoryServer5 &
-    [1] 4079484
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ Directory server listening on port 57535
-2. Start the chat server(s)
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ ./chatServer5 "KSU Football" 57890 &
-    [1] 4080791
-    Using certificates: certs/ksu-football-cert.pem and certs/ksu-football-key.pem
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ SSL connection established with directory server
-    Directory server certificate CN: Directory Server
-    Sent registration: R KSU Football 57890
-    Directory server response: R KSU Football 57890
+### The web side
 
-This also shows within the directory server:
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ Directory server listening on port 57535
-    Accepted new connection from 129.130.10.39
-    SSL handshake successful
-    Received message: R KSU Football 57890
-    Processing registration request
-    Parsed: topic='KSU Football', IP='129.130.10.39', port=57890, CN='KSU Football'
-    Registered: KSU Football at 129.130.10.39:57890
+```
+   Browser              Node proxy              C servers
+   ┌──────┐    ws://    ┌────────────┐  TLS    ┌──────────────────┐
+   │ HTML │◀──────────▶ │ server.js  │◀───────▶│ directoryServer5 │
+   │  JS  │             │            │         │ chatServer5 (×N) │
+   └──────┘             └────────────┘         └──────────────────┘
+```
 
-I then start another chat:
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ ./chatServer5 "Fortnite" 59876 &
-    [1] 4082321
-    Using certificates: certs/fortnite-cert.pem and certs/fortnite.pem
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ SSL connection established with directory server
-    Directory server certificate CN: Directory Server
-    Sent registration: R Fortnite 59876
-    Directory server response: R Fortnite 59876
+Browsers can't speak raw TLS-over-TCP, so a small Node.js proxy sits in the middle. From the C servers' perspective the proxy is just another TLS client — same handshake, same CN checks, same byte stream. From the browser's perspective the proxy is just a WebSocket server.
 
-this sends the information to the directory server as well
-    Accepted new connection from 129.130.10.39
-    SSL handshake successful
-    Received message: R Fortnite 59876
-    Processing registration request
-    Parsed: topic='Fortnite', IP='129.130.10.39', port=59876, CN='Fortnite'
-    Registered: Fortnite at 129.130.10.39:59876
+The proxy has two modes per WebSocket connection:
 
-3. Now, start a chatClient: (Terminal 1, patrick)
-    ptkehoe@cougar:~/cis525/Project-Assignment-7$ ./chatClient5
-    Connected to Directory Server 
-    Enter the name of the chat room you want to join (ie: KSU Football): 
-    Current Chat Rooms:
-    Topic: KSU Football, IP: 129.130.10.39, Port: 57890
-    Topic: Fortnite, IP: 129.130.10.39, Port: 59876
-    Enter in the topic of the chat room that you would like to join: KSU Football
-    Connected to chat server 'KSU Football'
-    Enter in your name: 
-    patrick kehoe
-    You are the first user to join the chat.
-    The user, timmy, has joined the chat
-    timmy: hi there 
-    hey man
+1. **Directory mode (initial).** Browser sends `{"type":"list"}` as JSON. Proxy connects to the directory server, sends `L`, parses the response, sends back `{"type":"rooms", rooms:[...]}`.
 
-then start another chatClient (terminal 2, timmy)
-    tkehoe@cougar:~/cis525/Project-Assignment-7$ ./chatClient5
-    Connected to Directory Server 
-    Enter the name of the chat room you want to join (ie: KSU Football): 
-    Current Chat Rooms:
-    Topic: KSU Football, IP: 129.130.10.39, Port: 57890
-    Topic: Fortnite, IP: 129.130.10.39, Port: 59876
-    Enter in the topic of the chat room that you would like to join: KSU Football
-    Connected to chat server 'KSU Football'
-    Enter in your name: 
-    timmy
-    hi there     
-    patrick kehoe: hey man
+2. **Chat mode (after join).** Browser sends `{"type":"join", topic, ip, port}`. Proxy opens a TLS connection to that chat server (verifying the CN matches the topic) and from then on becomes a transparent byte-pipe in both directions. Browser text → chat server. Chat server bytes → browser.
 
-As you can see, patrick joined first so he was prompted with the first user message and timmy was not.
+The frontend handles the C server's quirks — the username prompt, the `username: message` broadcast format, the join/leave notifications — and renders them appropriately as system messages, prompts, or chat bubbles.
 
-There is also a line printed in the chat server to where it shows the SSL handshake is completed with the client.
+## Project layout
 
-This allows no duplicate user names and only allows users to join validated chat rooms that are listed
+```
+.
+├── chatServer5.c          # The chat room process
+├── directoryServer5.c     # The room registry
+├── chatClient5.c          # Original CLI client (still works)
+├── common.h               # Shared constants (MAX, etc.)
+├── inet.h                 # Network config (host, port)
+├── certs/                 # Generated certs and CA bundle
+└── chat-web/              # Web frontend
+    ├── server.js          # Node proxy: HTTP static + WS bridge
+    ├── package.json
+    ├── public/
+    │   └── index.html     # Single-file frontend (HTML + CSS + JS)
+    └── certs/
+        └── ca-cert.pem    # Copy of the root CA to verify servers
+```
+
+## Setup
+
+### Prerequisites
+
+- A Linux or macOS machine (Windows works under WSL).
+- `gcc` or `clang`.
+- `openssl` development headers (`libssl-dev` on Debian/Ubuntu).
+- Node.js 18+ for the web layer.
+- The certificates: a CA cert plus a cert+key pair for each chat room and for the directory server. The Common Name on each cert must match the role it plays — `Directory Server` for the directory, the topic name for each chat room. Generation is out of scope for this README; any standard OpenSSL CA setup works.
+
+### Build the C side
+
+Compile each program against OpenSSL:
+
+```bash
+gcc -o directoryServer5 directoryServer5.c -lssl -lcrypto
+gcc -o chatServer5      chatServer5.c      -lssl -lcrypto
+gcc -o chatClient5      chatClient5.c      -lssl -lcrypto
+```
+
+Edit `inet.h` so the host address matches your setup. For everything-on-one-machine:
+
+```c
+#define SERV_HOST_ADDR "127.0.0.1"
+#define SERV_TCP_PORT  57535
+```
+
+Recompile after any change to `inet.h`.
+
+### Set up the web layer
+
+```bash
+cd chat-web
+npm install
+cp ../certs/ca-cert.pem certs/
+```
+
+The proxy needs the same CA cert your C servers were signed with — that's how it verifies their identities, exactly the way `chatClient5.c` does.
+
+## Running
+
+You'll want four terminals (or use a process manager — see below).
+
+**Terminal 1 — directory server:**
+```bash
+./directoryServer5
+```
+
+**Terminal 2+ — chat servers, one per room:**
+```bash
+./chatServer5 "KSU Football" 50000
+./chatServer5 "Puppies" 50001
+./chatServer5 "Fortnite" 50002
+```
+
+The topic name passed on the command line must match the Common Name on the cert files the server loads. See `set_cert_paths()` in `chatServer5.c` for the topic-to-cert mapping.
+
+**Terminal N — web proxy:**
+```bash
+cd chat-web
+npm start
+```
+
+Open **http://localhost:8080** in a browser. Pick a room, enter a username, chat.
+
+The original CLI client still works alongside the web frontend — they connect to the same chat servers and can chat with each other.
+
+```bash
+./chatClient5
+```
+
+## Configuration reference
+
+**`chat-web/server.js`** reads these environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DIRECTORY_HOST` | `127.0.0.1` | Where the directory server is listening |
+| `DIRECTORY_PORT` | `57535`     | Directory server's port |
+| `CA_FILE`        | `./certs/ca-cert.pem` | CA cert used to verify all servers |
+| `HTTP_PORT`      | `8080`      | What port the proxy listens on |
+
+Example:
+
+```bash
+DIRECTORY_HOST=127.0.0.1 HTTP_PORT=9000 npm start
+```
+
+## Design notes
+
+**Why a proxy instead of WebSockets in the C server?** Bolting WebSocket framing onto the existing C code would mean either pulling in `libwebsockets` (its own SSL context manager that conflicts with the existing OpenSSL setup) or hand-rolling the WS handshake and frame parser. Either way is more invasive than a small external proxy, and it would put the browser-specific concerns into code that has nothing else to do with browsers. Keeping the proxy separate means the C servers stay focused on their actual job.
+
+**Why isn't there a "register chat room" button in the web UI?** Registration requires a client certificate whose CN matches the room topic. That's an operator-level credential, not something a random web visitor should hold. Run `chatServer5` from a shell to register rooms; the web UI is for chat *users*, not operators.
+
+**The directory hands out whatever IP the chat server registered from.** It uses `inet_ntoa(cli_addr.sin_addr)` — the source IP of the chat server's TCP connection to the directory. If everything's on one box and `inet.h` says `127.0.0.1`, that's what gets registered, and the proxy can dial it. If a chat server registers from a LAN IP that the proxy can't route to, joining will fail. Loopback for local development.
+
+**The proxy is the only externally-facing component.** Your C servers never need to be reachable from outside the host. Bind them to localhost in production for an extra layer of safety (the existing code uses `INADDR_ANY` — fine if there's a host firewall, otherwise consider switching to `INADDR_LOOPBACK`).
+
+**TLS 1.3 minimum is enforced everywhere.** No fallback to older versions. If a peer can't speak 1.3, the handshake fails — which is what you want.
+
+## License
+
+Educational project. Use as you like.
